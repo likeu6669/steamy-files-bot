@@ -26,12 +26,9 @@ const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
 const { createSupportBot, normalizeUsername } = require('./support-bot');
 
 const SUPPORT_BOT_TOKEN = process.env.SUPPORT_BOT_TOKEN;
+const DEFAULT_SUPPORT_USERNAME = 'SteamySupportBot';
 const SUPPORT_BOT_USERNAME = normalizeUsername(process.env.SUPPORT_BOT_USERNAME);
-const RULES_CONTACT =
-  SUPPORT_BOT_USERNAME ||
-  process.env.RULES_CONTACT ||
-  process.env.STORE_RULES_CONTACT ||
-  '@rule6669';
+const RULES_CONTACT = SUPPORT_BOT_USERNAME || normalizeUsername(DEFAULT_SUPPORT_USERNAME);
 
 if (!BOT_TOKEN) {
   console.error('Нужна переменная окружения BOT_TOKEN');
