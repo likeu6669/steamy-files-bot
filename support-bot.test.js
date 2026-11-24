@@ -23,6 +23,8 @@ const {
   rememberFingerprint,
   evaluateTopicLimit,
   floodNoticeText,
+  limitReplyKind,
+  replaceSupportReply,
   DEFAULT_TOPIC,
   FLOOD_MINUTE_LIMIT,
   FLOOD_MINUTE_MS,
@@ -198,6 +200,54 @@ assert.strictEqual(DEFAULT_TOPIC, 'other');
 assert.strictEqual(STRIKE_LIMIT, 3);
 assert.ok(STRIKE_WINDOW_MS >= 10 * 60 * 1000);
 
+
+assert.strictEqual(limitReplyKind({ action: 'muted' }), 'mute');
+assert.strictEqual(limitReplyKind({ action: 'limited' }), 'wait');
+assert.strictEqual(limitReplyKind({ action: 'limited', reason: 'day' }), 'wait');
+
+async function testSupportDedupe() {
+  const calls = [];
+  const helper = async (ctx, tag, kind, sendFn, options) => {
+    calls.push({ tag, kind, deleteIncoming: options && options.deleteIncoming, hasUserMessage: Boolean(ctx.message) });
+    return sendFn();
+  };
+  const ctx = { message: { message_id: 55 } };
+  const sent = await replaceSupportReply(helper, ctx, 'ack', async () => ({ message_id: 99, text: 'Сообщение получено, ответим здесь.' }));
+  assert.strictEqual(sent.message_id, 99);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].tag, 'support');
+  assert.strictEqual(calls[0].kind, 'ack');
+  assert.strictEqual(calls[0].deleteIncoming, false);
+  assert.strictEqual(calls[0].hasUserMessage, true);
+
+  const noHelper = await replaceSupportReply(null, ctx, 'wait', async () => ({ message_id: 7 }));
+  assert.strictEqual(noHelper.message_id, 7);
+
+  // Local model of replaceCommandReply: service dedupe must not delete the user ticket
+  const deleted = [];
+  const last = new Map();
+  async function replaceCommandReply(ctx, botTag, kind, sendFn, options) {
+    const key = botTag + ':' + ctx.chat.id + ':' + kind;
+    const previousId = last.get(key);
+    const deleteIncoming = !options || options.deleteIncoming !== false;
+    const sent = await sendFn();
+    last.set(key, sent.message_id);
+    if (previousId && previousId !== sent.message_id) deleted.push(previousId);
+    if (deleteIncoming && ctx.message && ctx.message.message_id) deleted.push(ctx.message.message_id);
+    return sent;
+  }
+  const userCtx = { chat: { id: 42 }, message: { message_id: 100 }, telegram: {} };
+  await replaceCommandReply(userCtx, 'support', 'ack', async () => ({ message_id: 201 }), { deleteIncoming: false });
+  await replaceCommandReply(userCtx, 'support', 'ack', async () => ({ message_id: 202 }), { deleteIncoming: false });
+  assert.deepStrictEqual(deleted, [201]);
+  assert.ok(!deleted.includes(100));
+
+  await replaceCommandReply(userCtx, 'support', 'start', async () => ({ message_id: 301 }));
+  await replaceCommandReply(userCtx, 'support', 'start', async () => ({ message_id: 302 }));
+  assert.ok(deleted.includes(301));
+  assert.ok(deleted.includes(100));
+}
+
 const { createSupportBot } = require('./support-bot');
 const support = createSupportBot({
   token: '123:ABC',
@@ -235,7 +285,9 @@ async function mockRelay() {
   assert.ok(sent[sent.length - 1].text.startsWith('Ответ поддержки:'));
 }
 
-mockRelay().then(() => {
+mockRelay()
+  .then(() => testSupportDedupe())
+  .then(() => {
   console.log('SUPPORT_LOGIC_OK');
 }).catch((err) => {
   console.error(err);

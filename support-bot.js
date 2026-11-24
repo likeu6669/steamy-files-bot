@@ -283,6 +283,17 @@ async function tryDeleteUserMessage(ctx) {
   }
 }
 
+function limitReplyKind(result) {
+  return result && result.action === 'muted' ? 'mute' : 'wait';
+}
+
+function replaceSupportReply(helper, ctx, kind, sendFn) {
+  if (typeof helper === 'function') {
+    return helper(ctx, 'support', kind, sendFn, { deleteIncoming: false });
+  }
+  return sendFn();
+}
+
 function prefixText(body, lang) {
   const texts = TEXTS[lang] || TEXTS.ru;
   return texts.prefix + '\n\n' + body;
@@ -625,7 +636,9 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
     session.lang = lang;
     session.ackForTopic = null;
     const txt = TEXTS[lang];
-    await ctx.reply(txt.topicSet + ': ' + topicLabel(topicKey, lang) + '.\n\n' + txt.prompt);
+    await replaceSupportReply(replaceCommandReply, ctx, 'topic', () =>
+      ctx.reply(txt.topicSet + ': ' + topicLabel(topicKey, lang) + '.\n\n' + txt.prompt)
+    );
   });
 
   bot.on('message', async (ctx) => {
@@ -668,7 +681,9 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
       if (!rec.bannedNotified) {
         rec.bannedNotified = true;
         setFlood(fromId, rec);
-        await ctx.reply(TEXTS[lang].banned);
+        await replaceSupportReply(replaceCommandReply, ctx, 'banned', () =>
+          ctx.reply(TEXTS[lang].banned)
+        );
       }
       return;
     }
@@ -691,7 +706,9 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
           persist();
         }
         if (result.notifyUser) {
-          await ctx.reply(floodNoticeText(lang, result));
+          await replaceSupportReply(replaceCommandReply, ctx, limitReplyKind(result), () =>
+            ctx.reply(floodNoticeText(lang, result))
+          );
         }
         return;
       }
@@ -715,7 +732,9 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
 
     if (session.ackForTopic !== session.topic) {
       session.ackForTopic = session.topic;
-      await ctx.reply(TEXTS[session.lang].ack);
+      await replaceSupportReply(replaceCommandReply, ctx, 'ack', () =>
+        ctx.reply(TEXTS[session.lang].ack)
+      );
     }
   });
 
@@ -794,6 +813,8 @@ module.exports = {
   rememberFingerprint,
   evaluateTopicLimit,
   floodNoticeText,
+  limitReplyKind,
+  replaceSupportReply,
   TOPICS,
   DEFAULT_TOPIC,
   FLOOD_LIMIT,
