@@ -60,6 +60,46 @@ let STORE_HOOK_PATH = null;
 let STORE_WEBHOOK_SECRET = null;
 let usingStoreWebhook = false;
 
+const lastCommandReplies = new Map();
+
+function commandReplyKey(botTag, chatId, kind) {
+  return botTag + ':' + chatId + ':' + kind;
+}
+
+function sentMessageId(sent) {
+  if (!sent) return null;
+  if (sent.message_id) return sent.message_id;
+  if (sent.message && sent.message.message_id) return sent.message.message_id;
+  return null;
+}
+
+async function tryDeleteMessage(telegram, chatId, messageId) {
+  if (!telegram || !chatId || !messageId) return;
+  try {
+    await telegram.deleteMessage(chatId, messageId);
+  } catch {
+    // 48 hours passed, already deleted, or the bot cannot delete it
+  }
+}
+
+async function replaceCommandReply(ctx, botTag, kind, sendFn) {
+  const chatId = ctx.chat && ctx.chat.id;
+  const key = commandReplyKey(botTag, chatId, kind);
+  const previousId = lastCommandReplies.get(key);
+
+  const sent = await sendFn();
+  const newId = sentMessageId(sent);
+  if (newId) lastCommandReplies.set(key, newId);
+
+  if (previousId && previousId !== newId) {
+    await tryDeleteMessage(ctx.telegram, chatId, previousId);
+  }
+  if (ctx.message && ctx.message.message_id) {
+    await tryDeleteMessage(ctx.telegram, chatId, ctx.message.message_id);
+  }
+  return sent;
+}
+
 const STORE_TEXTS = {
   ru: {
     welcome:
@@ -129,13 +169,12 @@ async function sendStoreWelcome(ctx) {
   const extra = { caption: txt.welcome, reply_markup: storeKeyboard(lang) };
   if (fs.existsSync(STORE_WELCOME_PHOTO)) {
     try {
-      await ctx.replyWithPhoto({ source: STORE_WELCOME_PHOTO }, extra);
-      return;
+      return await ctx.replyWithPhoto({ source: STORE_WELCOME_PHOTO }, extra);
     } catch (err) {
       console.error('store welcome photo failed', err);
     }
   }
-  await ctx.reply(txt.welcome, { reply_markup: storeKeyboard(lang) });
+  return ctx.reply(txt.welcome, { reply_markup: storeKeyboard(lang) });
 }
 
 function attachStoreHandlers(store) {
@@ -143,7 +182,7 @@ function attachStoreHandlers(store) {
     if (!isPrivateChat(ctx)) {
       return ctx.reply(STORE_TEXTS[storeLang(ctx)].writePrivate);
     }
-    await sendStoreWelcome(ctx);
+    await replaceCommandReply(ctx, 'store', 'start', () => sendStoreWelcome(ctx));
   });
 
   store.command('help', async (ctx) => {
@@ -151,14 +190,18 @@ function attachStoreHandlers(store) {
       return ctx.reply(STORE_TEXTS[storeLang(ctx)].writePrivate);
     }
     const lang = storeLang(ctx);
-    await ctx.reply(STORE_TEXTS[lang].help, { reply_markup: storeKeyboard(lang) });
+    await replaceCommandReply(ctx, 'store', 'help', () =>
+      ctx.reply(STORE_TEXTS[lang].help, { reply_markup: storeKeyboard(lang) })
+    );
   });
 
   store.command('rules', async (ctx) => {
     if (!isPrivateChat(ctx)) {
       return ctx.reply(STORE_TEXTS[storeLang(ctx)].writePrivate);
     }
-    await ctx.reply(STORE_TEXTS[storeLang(ctx)].rules);
+    await replaceCommandReply(ctx, 'store', 'rules', () =>
+      ctx.reply(STORE_TEXTS[storeLang(ctx)].rules)
+    );
   });
 
   store.action('rules', async (ctx) => {
@@ -166,7 +209,9 @@ function attachStoreHandlers(store) {
     if (!isPrivateChat(ctx)) {
       return ctx.reply(STORE_TEXTS[storeLang(ctx)].writePrivate);
     }
-    await ctx.reply(STORE_TEXTS[storeLang(ctx)].rules);
+    await replaceCommandReply(ctx, 'store', 'rules', () =>
+      ctx.reply(STORE_TEXTS[storeLang(ctx)].rules)
+    );
   });
 
   store.catch((err) => {
@@ -292,13 +337,12 @@ async function sendFilesWelcome(ctx) {
   const extra = { caption: txt.welcome, reply_markup: filesWelcomeKeyboard(lang) };
   if (fs.existsSync(FILES_WELCOME_PHOTO)) {
     try {
-      await ctx.replyWithPhoto({ source: FILES_WELCOME_PHOTO }, extra);
-      return;
+      return await ctx.replyWithPhoto({ source: FILES_WELCOME_PHOTO }, extra);
     } catch (err) {
       console.error('files welcome photo failed', err);
     }
   }
-  await ctx.reply(txt.welcome, { reply_markup: filesWelcomeKeyboard(lang) });
+  return ctx.reply(txt.welcome, { reply_markup: filesWelcomeKeyboard(lang) });
 }
 
 function deliveryKeyboard(gameId, lang) {
@@ -482,7 +526,7 @@ bot.start(async (ctx) => {
   const payload = ctx.startPayload;
   const gameId = payload && payload.startsWith('game_') ? String(payload).slice('game_'.length) : '';
   if (!isGameId(gameId)) {
-    return sendFilesWelcome(ctx);
+    return replaceCommandReply(ctx, 'files', 'start', () => sendFilesWelcome(ctx));
   }
 
   if (!isAdmin(ctx) && ctx.from && rateLimited(ctx.from.id)) {
@@ -502,14 +546,18 @@ bot.command('help', async (ctx) => {
     return askToWritePrivately(ctx);
   }
   const lang = userLang(ctx);
-  await ctx.reply(FILES_TEXTS[lang].help, { reply_markup: filesWelcomeKeyboard(lang) });
+  await replaceCommandReply(ctx, 'files', 'help', () =>
+    ctx.reply(FILES_TEXTS[lang].help, { reply_markup: filesWelcomeKeyboard(lang) })
+  );
 });
 
 bot.command('rules', async (ctx) => {
   if (!isPrivateChat(ctx)) {
     return askToWritePrivately(ctx);
   }
-  await ctx.reply(FILES_TEXTS[userLang(ctx)].rules);
+  await replaceCommandReply(ctx, 'files', 'rules', () =>
+    ctx.reply(FILES_TEXTS[userLang(ctx)].rules)
+  );
 });
 
 bot.action('rules', async (ctx) => {
@@ -517,7 +565,9 @@ bot.action('rules', async (ctx) => {
   if (!isPrivateChat(ctx)) {
     return askToWritePrivately(ctx);
   }
-  await ctx.reply(FILES_TEXTS[userLang(ctx)].rules);
+  await replaceCommandReply(ctx, 'files', 'rules', () =>
+    ctx.reply(FILES_TEXTS[userLang(ctx)].rules)
+  );
 });
 
 bot.command('link', async (ctx) => {
