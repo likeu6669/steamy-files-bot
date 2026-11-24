@@ -1,20 +1,32 @@
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
+const http = require('http');
 
-const bot = new Telegraf(process.env.BOT_TOKEN); // токен из переменной окружения
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const DB_FILE = './games.json';
 
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) return {};
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
 }
 
 function saveDB(db) {
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
-// Админ-команда: /add 2  → потом отправь файл
+// Простой сервер, чтобы Render не убивал процесс
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is alive');
+}).listen(PORT);
+
+// Админ: /add 2 → потом файл
 bot.command('add', async (ctx) => {
   const id = ctx.message.text.split(' ')[1];
   if (!id) return ctx.reply('Использование: /add 2');
@@ -34,9 +46,9 @@ bot.on('document', async (ctx) => {
   await ctx.reply(`Файл сохранён для игры ${gameId}`);
 });
 
-// Обработка перехода из Mini App: /start game_2
+// /start game_2
 bot.start(async (ctx) => {
-  const payload = ctx.startPayload; // game_2
+  const payload = ctx.startPayload;
   if (!payload || !payload.startsWith('game_')) {
     return ctx.reply('Привет! Я бот-хранилище Steamy Store.\nВыбери игру в Mini App и нажми «Скачать в Telegram».');
   }
@@ -46,7 +58,7 @@ bot.start(async (ctx) => {
   const fileId = db[gameId];
 
   if (!fileId) {
-    return ctx.reply(`Файл для этой игры ещё не загружен.\nНапиши админу.`);
+    return ctx.reply(`Файл для этой игры ещё не загружен.`);
   }
 
   await ctx.replyWithDocument(fileId, {
@@ -55,4 +67,4 @@ bot.start(async (ctx) => {
 });
 
 bot.launch();
-console.log('Bot started');
+console.log('Bot started on port', PORT);
