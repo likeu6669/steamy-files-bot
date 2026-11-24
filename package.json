@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node support-bot.test.js"
+    "test": "node support-bot.test.js && node antispam.test.js"
   },
   "dependencies": {
     "telegraf": "^4.16.3"
