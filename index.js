@@ -87,10 +87,11 @@ async function tryDeleteMessage(telegram, chatId, messageId) {
   }
 }
 
-async function replaceCommandReply(ctx, botTag, kind, sendFn) {
+async function replaceCommandReply(ctx, botTag, kind, sendFn, options) {
   const chatId = ctx.chat && ctx.chat.id;
   const key = commandReplyKey(botTag, chatId, kind);
   const previousId = lastCommandReplies.get(key);
+  const deleteIncoming = !options || options.deleteIncoming !== false;
 
   const sent = await sendFn();
   const newId = sentMessageId(sent);
@@ -99,7 +100,7 @@ async function replaceCommandReply(ctx, botTag, kind, sendFn) {
   if (previousId && previousId !== newId) {
     await tryDeleteMessage(ctx.telegram, chatId, previousId);
   }
-  if (ctx.message && ctx.message.message_id) {
+  if (deleteIncoming && ctx.message && ctx.message.message_id) {
     await tryDeleteMessage(ctx.telegram, chatId, ctx.message.message_id);
   }
   return sent;
