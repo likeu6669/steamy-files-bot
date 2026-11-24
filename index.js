@@ -15,6 +15,7 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 
 const FILES_PATH = path.join(__dirname, 'files.json');
 const RATE_MS = 10000;
+const PART_DELAY_MS = 400;
 const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
 
 if (!BOT_TOKEN) {
@@ -74,6 +75,10 @@ function trySaveFiles() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getForwardedPost(msg) {
   if (!msg) return null;
   if (msg.forward_origin && msg.forward_origin.type === 'channel') {
@@ -99,21 +104,11 @@ function rateLimited(userId) {
   return false;
 }
 
-const WAIT_TEXT = '⏳ Файл скоро придёт, подождите до 20 секунд…';
-const DONE_TEXT = '✅ Файл отправлен.';
-
 async function sendGameFiles(telegram, chatId, gameId) {
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
     await telegram.sendMessage(chatId, 'Файл для этой игры ещё не загружен.');
     return false;
-  }
-
-  let notice;
-  try {
-    notice = await telegram.sendMessage(chatId, WAIT_TEXT);
-  } catch (err) {
-    console.error('wait notice failed', err);
   }
 
   let sent = 0;
@@ -134,10 +129,7 @@ async function sendGameFiles(telegram, chatId, gameId) {
           : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
       ).catch(() => {});
     }
-  }
-
-  if (notice && sent > 0) {
-    await telegram.editMessageText(chatId, notice.message_id, undefined, DONE_TEXT).catch(() => {});
+    if (i < posts.length - 1) await sleep(PART_DELAY_MS);
   }
   return sent > 0;
 }
