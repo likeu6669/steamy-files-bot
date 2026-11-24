@@ -18,9 +18,12 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .filter((n) => Number.isInteger(n));
 
 const FILES_PATH = path.join(__dirname, 'files.json');
+const GAMES_PATH = path.join(__dirname, 'games.json');
+const FILES_WELCOME_PHOTO = path.join(__dirname, 'assets', 'files-welcome.jpg');
 const RATE_MS = 10000;
 const PART_DELAY_MS = 400;
 const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
+const RULES_CONTACT = process.env.RULES_CONTACT || process.env.STORE_RULES_CONTACT || '@rule6669';
 
 if (!BOT_TOKEN) {
   console.error('Нужна переменная окружения BOT_TOKEN');
@@ -49,7 +52,6 @@ let usingWebhook = false;
 const STORE_BOT_TOKEN = process.env.STORE_BOT_TOKEN;
 const STORE_WEBAPP_URL = String(process.env.STORE_WEBAPP_URL || 'https://steamy-store.vercel.app').replace(/\/$/, '');
 const STORE_CHANNEL_URL = 'https://t.me/steamystore';
-const STORE_RULES_CONTACT = process.env.STORE_RULES_CONTACT || '@rule6669';
 const STORE_WELCOME_PHOTO = path.join(__dirname, 'assets', 'welcome.jpg');
 
 let storeBot = null;
@@ -76,7 +78,7 @@ const STORE_TEXTS = {
       '3. Файлы предназначены только для личного использования. Перепродавать их или выдавать за свои запрещено.\n' +
       '4. Вы скачиваете и устанавливаете файлы на свой страх и риск.\n' +
       '5. Если вы правообладатель и хотите, чтобы игру убрали, напишите: ' +
-      STORE_RULES_CONTACT +
+      RULES_CONTACT +
       '.',
     writePrivate: 'Напишите мне в личные сообщения.'
   },
@@ -97,7 +99,7 @@ const STORE_TEXTS = {
       '3. Files are for personal use only. Reselling them or passing them off as your own is prohibited.\n' +
       '4. You download and install files at your own risk.\n' +
       '5. If you are a rights holder and want a game removed, write to: ' +
-      STORE_RULES_CONTACT +
+      RULES_CONTACT +
       '.',
     writePrivate: 'Please message me in a private chat.'
   }
@@ -195,6 +197,137 @@ function loadFiles() {
 
 let files = loadFiles();
 
+function loadGames() {
+  if (!fs.existsSync(GAMES_PATH)) return {};
+  try {
+    const data = JSON.parse(fs.readFileSync(GAMES_PATH, 'utf8'));
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+const gamesMeta = loadGames();
+
+function gameMeta(gameId) {
+  return gamesMeta[String(gameId)] || null;
+}
+
+function miniAppUrl(gameId) {
+  return gameId ? MINI_APP_URL + '=game_' + gameId : MINI_APP_URL;
+}
+
+function userLang(ctx) {
+  const code = String((ctx.from && ctx.from.language_code) || 'ru').toLowerCase();
+  return code.startsWith('en') ? 'en' : 'ru';
+}
+
+const FILES_TEXTS = {
+  ru: {
+    welcome:
+      'Привет! Я бот-хранилище Steamy Store.\n' +
+      'Откройте магазин, выберите игру и нажмите «Скачать в Telegram» — я пришлю файл в этот чат. 18+.',
+    open: '🎮 Открыть магазин',
+    channel: '📢 Канал',
+    rulesBtn: '📜 Правила',
+    help:
+      'Я выдаю файлы игр из Steamy Store.\n' +
+      'Откройте магазин, выберите карточку и нажмите «Скачать в Telegram». Здесь только публичные версии, 18+.\n\n' +
+      'Канал новостей: @steamystore',
+    rules:
+      '🔞 Правила Steamy Files\n\n' +
+      '1. Вам исполнилось 18 лет. Здесь игры для взрослых с откровенным контентом.\n' +
+      '2. Все игры принадлежат их разработчикам. Если игра понравилась, поддержите автора: кнопка есть в карточке игры.\n' +
+      '3. Файлы предназначены только для личного использования. Перепродавать их или выдавать за свои запрещено.\n' +
+      '4. Вы скачиваете и устанавливаете файлы на свой страх и риск.\n' +
+      '5. Если вы правообладатель и хотите, чтобы игру убрали, напишите: ' +
+      RULES_CONTACT +
+      '.',
+    support: '❤️ Поддержать разработчика',
+    store: '🎮 Магазин',
+    version: 'Версия'
+  },
+  en: {
+    welcome:
+      'Hi! I am the Steamy Store file bot.\n' +
+      'Open the shop, pick a game and tap “Download in Telegram” — I will send the file here. 18+.',
+    open: '🎮 Open the store',
+    channel: '📢 Channel',
+    rulesBtn: '📜 Rules',
+    help:
+      'I deliver game files from Steamy Store.\n' +
+      'Open the shop, open a game card and tap “Download in Telegram”. These are public versions only, 18+.\n\n' +
+      'News channel: @steamystore',
+    rules:
+      '🔞 Steamy Files rules\n\n' +
+      '1. You are 18 or older. This catalog has adult games with explicit content.\n' +
+      '2. All games belong to their developers. If you enjoyed a game, support the author: the button is on the game card.\n' +
+      '3. Files are for personal use only. Reselling them or passing them off as your own is prohibited.\n' +
+      '4. You download and install files at your own risk.\n' +
+      '5. If you are a rights holder and want a game removed, write to: ' +
+      RULES_CONTACT +
+      '.',
+    support: '❤️ Support the developer',
+    store: '🎮 Store',
+    version: 'Version'
+  }
+};
+
+function filesWelcomeKeyboard(lang) {
+  const txt = FILES_TEXTS[lang] || FILES_TEXTS.ru;
+  return {
+    inline_keyboard: [
+      [{ text: txt.open, url: MINI_APP_URL }],
+      [
+        { text: txt.channel, url: STORE_CHANNEL_URL },
+        { text: txt.rulesBtn, callback_data: 'rules' }
+      ]
+    ]
+  };
+}
+
+async function sendFilesWelcome(ctx) {
+  const lang = userLang(ctx);
+  const txt = FILES_TEXTS[lang];
+  const extra = { caption: txt.welcome, reply_markup: filesWelcomeKeyboard(lang) };
+  if (fs.existsSync(FILES_WELCOME_PHOTO)) {
+    try {
+      await ctx.replyWithPhoto({ source: FILES_WELCOME_PHOTO }, extra);
+      return;
+    } catch (err) {
+      console.error('files welcome photo failed', err);
+    }
+  }
+  await ctx.reply(txt.welcome, { reply_markup: filesWelcomeKeyboard(lang) });
+}
+
+function deliveryKeyboard(gameId, lang) {
+  const txt = FILES_TEXTS[lang] || FILES_TEXTS.ru;
+  const meta = gameMeta(gameId);
+  const row = [];
+  if (meta && meta.supportUrl) {
+    row.push({ text: txt.support, url: meta.supportUrl });
+  }
+  row.push({ text: txt.store, url: miniAppUrl(gameId) });
+  return { inline_keyboard: [row] };
+}
+
+function deliveryText(gameId, lang) {
+  const txt = FILES_TEXTS[lang] || FILES_TEXTS.ru;
+  const meta = gameMeta(gameId);
+  const name = (meta && meta.name) || ('Игра ' + gameId);
+  if (meta && meta.version) {
+    return '📦 ' + name + '\n' + txt.version + ': ' + meta.version;
+  }
+  return '📦 ' + name;
+}
+
+async function sendDeliveryCard(telegram, chatId, gameId, lang) {
+  await telegram.sendMessage(chatId, deliveryText(gameId, lang), {
+    reply_markup: deliveryKeyboard(gameId, lang)
+  });
+}
+
 function isAdmin(ctx) {
   return Boolean(ctx.from && ADMIN_IDS.includes(ctx.from.id));
 }
@@ -261,11 +394,17 @@ setInterval(() => {
   }
 }, RATE_SWEEP_MS).unref();
 
-async function sendGameFiles(telegram, chatId, gameId) {
+async function sendGameFiles(telegram, chatId, gameId, lang) {
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
     await telegram.sendMessage(chatId, 'Файл для этой игры ещё не загружен.');
     return false;
+  }
+
+  try {
+    await sendDeliveryCard(telegram, chatId, gameId, lang || 'ru');
+  } catch (err) {
+    console.error('delivery card failed', err);
   }
 
   let sent = 0;
@@ -311,16 +450,9 @@ bot.start(async (ctx) => {
   }
 
   const payload = ctx.startPayload;
-  if (!payload || !payload.startsWith('game_')) {
-    return ctx.reply(
-      'Привет! Я бот-хранилище Steamy Store.\nВыбери игру в Mini App и нажми «Скачать в Telegram».\n\n' +
-      MINI_APP_URL
-    );
-  }
-
-  const gameId = String(payload).replace('game_', '');
+  const gameId = payload && payload.startsWith('game_') ? String(payload).slice('game_'.length) : '';
   if (!isGameId(gameId)) {
-    return ctx.reply('Некорректный идентификатор игры.');
+    return sendFilesWelcome(ctx);
   }
 
   if (!isAdmin(ctx) && ctx.from && rateLimited(ctx.from.id)) {
@@ -328,11 +460,34 @@ bot.start(async (ctx) => {
   }
 
   try {
-    await sendGameFiles(ctx.telegram, ctx.chat.id, gameId);
+    await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
   } catch (err) {
     console.error('start delivery failed', err);
     await ctx.reply('Не удалось отправить файл. Попробуйте ещё раз позже.').catch(() => {});
   }
+});
+
+bot.command('help', async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    return askToWritePrivately(ctx);
+  }
+  const lang = userLang(ctx);
+  await ctx.reply(FILES_TEXTS[lang].help, { reply_markup: filesWelcomeKeyboard(lang) });
+});
+
+bot.command('rules', async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    return askToWritePrivately(ctx);
+  }
+  await ctx.reply(FILES_TEXTS[userLang(ctx)].rules);
+});
+
+bot.action('rules', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isPrivateChat(ctx)) {
+    return askToWritePrivately(ctx);
+  }
+  await ctx.reply(FILES_TEXTS[userLang(ctx)].rules);
 });
 
 bot.command('link', async (ctx) => {
@@ -368,7 +523,7 @@ bot.command('test', async (ctx) => {
     return ctx.reply('Использование: /test 2');
   }
   try {
-    await sendGameFiles(ctx.telegram, ctx.chat.id, gameId);
+    await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
   } catch (err) {
     console.error('test delivery failed', err);
     await ctx.reply('Не удалось отправить файл. Проверьте, что бот — админ канала, и что номера постов верные.');
@@ -438,6 +593,22 @@ async function startStoreBot(base) {
   }
 }
 
+async function setupFilesCommands() {
+  await bot.telegram.setMyCommands(
+    [
+      { command: 'start', description: 'Начать' },
+      { command: 'help', description: 'Помощь' },
+      { command: 'rules', description: 'Правила' }
+    ],
+    { language_code: 'ru' }
+  );
+  await bot.telegram.setMyCommands([
+    { command: 'start', description: 'Start' },
+    { command: 'help', description: 'Help' },
+    { command: 'rules', description: 'Rules' }
+  ]);
+}
+
 async function startBot() {
   const base = webhookBaseUrl();
   if (base) {
@@ -445,12 +616,22 @@ async function startBot() {
     const url = base + HOOK_PATH;
     await bot.telegram.setWebhook(url, { secret_token: WEBHOOK_SECRET });
     console.log('Bot started on port', PORT, 'webhook:', base + '/webhook/...');
+    try {
+      await setupFilesCommands();
+    } catch (err) {
+      console.error('Не удалось обновить меню команд бота файлов', err);
+    }
     await startStoreBot(base);
     return;
   }
 
   await bot.launch();
   console.log('Bot started on port', PORT, '(long polling: нет WEBHOOK_URL / RENDER_EXTERNAL_URL)');
+  try {
+    await setupFilesCommands();
+  } catch (err) {
+    console.error('Не удалось обновить меню команд бота файлов', err);
+  }
   await startStoreBot(null);
 }
 
