@@ -5,7 +5,11 @@ const path = require('path');
 const crypto = require('crypto');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID || '-1004302896014';
+const DEFAULT_STORAGE_CHANNEL_ID = '-1004302896014';
+const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID || DEFAULT_STORAGE_CHANNEL_ID;
+if (!process.env.STORAGE_CHANNEL_ID) {
+  console.warn('STORAGE_CHANNEL_ID не задан, используется значение по умолчанию');
+}
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',')
   .map((s) => s.trim())
@@ -58,6 +62,14 @@ function isAdmin(ctx) {
   return Boolean(ctx.from && ADMIN_IDS.includes(ctx.from.id));
 }
 
+function isPrivateChat(ctx) {
+  return ctx.chat && ctx.chat.type === 'private';
+}
+
+function askToWritePrivately(ctx) {
+  return ctx.reply('Напишите мне в личные сообщения, чтобы получить файл.');
+}
+
 function isGameId(id) {
   return /^\d+$/.test(id);
 }
@@ -104,6 +116,14 @@ function rateLimited(userId) {
   return false;
 }
 
+const RATE_SWEEP_MS = 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, ts] of lastRequestAt) {
+    if (now - ts >= RATE_MS) lastRequestAt.delete(userId);
+  }
+}, RATE_SWEEP_MS).unref();
+
 async function sendGameFiles(telegram, chatId, gameId) {
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
@@ -146,6 +166,10 @@ const server = http.createServer((req, res) => {
 });
 
 bot.start(async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    return askToWritePrivately(ctx);
+  }
+
   const payload = ctx.startPayload;
   if (!payload || !payload.startsWith('game_')) {
     return ctx.reply(
@@ -196,6 +220,9 @@ bot.command('files', async (ctx) => {
 
 bot.command('test', async (ctx) => {
   if (!isAdmin(ctx)) return;
+  if (!isPrivateChat(ctx)) {
+    return askToWritePrivately(ctx);
+  }
   const gameId = ctx.message.text.split(/\s+/)[1];
   if (!isGameId(gameId || '')) {
     return ctx.reply('Использование: /test 2');
@@ -231,6 +258,7 @@ bot.catch((err) => {
 
 process.on('uncaughtException', (err) => {
   console.error('uncaughtException', err);
+  process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
   console.error('unhandledRejection', err);
