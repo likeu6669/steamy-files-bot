@@ -243,9 +243,9 @@ const FILES_TEXTS = {
       '5. Если вы правообладатель и хотите, чтобы игру убрали, напишите: ' +
       RULES_CONTACT +
       '.',
-    support: '❤️ Поддержать разработчика',
+    support: '❤️ Автору',
     store: '🎮 Магазин',
-    version: 'Версия'
+    belongs: 'Игра принадлежит разработчику — поддержите автора'
   },
   en: {
     welcome:
@@ -267,9 +267,9 @@ const FILES_TEXTS = {
       '5. If you are a rights holder and want a game removed, write to: ' +
       RULES_CONTACT +
       '.',
-    support: '❤️ Support the developer',
+    support: '❤️ Author',
     store: '🎮 Store',
-    version: 'Version'
+    belongs: 'This game belongs to its developer — please support the author'
   }
 };
 
@@ -316,10 +316,17 @@ function deliveryText(gameId, lang) {
   const txt = FILES_TEXTS[lang] || FILES_TEXTS.ru;
   const meta = gameMeta(gameId);
   const name = (meta && meta.name) || ('Игра ' + gameId);
-  if (meta && meta.version) {
-    return '📦 ' + name + '\n' + txt.version + ': ' + meta.version;
-  }
-  return '📦 ' + name;
+  let title = '🎮 ' + name;
+  if (meta && meta.version) title += ' ' + meta.version;
+  title += ' · Android';
+  return title + '\n\n' + txt.belongs;
+}
+
+function deliveryExtra(gameId, lang) {
+  return {
+    caption: deliveryText(gameId, lang),
+    reply_markup: deliveryKeyboard(gameId, lang)
+  };
 }
 
 async function sendDeliveryCard(telegram, chatId, gameId, lang) {
@@ -394,6 +401,13 @@ setInterval(() => {
   }
 }, RATE_SWEEP_MS).unref();
 
+async function copyGamePost(telegram, chatId, postId, extra) {
+  if (extra) {
+    return telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId, extra);
+  }
+  return telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId);
+}
+
 async function sendGameFiles(telegram, chatId, gameId, lang) {
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
@@ -401,29 +415,45 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
     return false;
   }
 
-  try {
-    await sendDeliveryCard(telegram, chatId, gameId, lang || 'ru');
-  } catch (err) {
-    console.error('delivery card failed', err);
-  }
-
+  const cardLang = lang || 'ru';
+  const cardExtra = deliveryExtra(gameId, cardLang);
   let sent = 0;
   for (let i = 0; i < posts.length; i++) {
+    const extra = i === 0 ? cardExtra : undefined;
     try {
-      await telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, posts[i]);
+      await copyGamePost(telegram, chatId, posts[i], extra);
       sent += 1;
     } catch (err) {
       const desc = (err && err.description) || (err && err.message) || 'неизвестная ошибка';
-      console.error('copyMessage failed', { gameId, postId: posts[i], desc });
+      console.error('copyMessage failed', { gameId, postId: posts[i], desc, withCaption: Boolean(extra) });
       if (String(desc).includes('blocked') || String(desc).includes('bot was blocked')) {
         return false;
       }
-      await telegram.sendMessage(
-        chatId,
-        posts.length > 1
-          ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
-          : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
-      ).catch(() => {});
+      if (extra) {
+        try {
+          await copyGamePost(telegram, chatId, posts[i]);
+          sent += 1;
+          await sendDeliveryCard(telegram, chatId, gameId, cardLang).catch((cardErr) => {
+            console.error('delivery card fallback failed', cardErr);
+          });
+        } catch (plainErr) {
+          const plainDesc = (plainErr && plainErr.description) || (plainErr && plainErr.message) || desc;
+          console.error('copyMessage fallback failed', { gameId, postId: posts[i], desc: plainDesc });
+          await telegram.sendMessage(
+            chatId,
+            posts.length > 1
+              ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
+              : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
+          ).catch(() => {});
+        }
+      } else {
+        await telegram.sendMessage(
+          chatId,
+          posts.length > 1
+            ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
+            : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
+        ).catch(() => {});
+      }
     }
     if (i < posts.length - 1) await sleep(PART_DELAY_MS);
   }
