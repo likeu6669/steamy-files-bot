@@ -2,6 +2,7 @@ const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID || '-1004302896014';
@@ -24,6 +25,22 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 const lastRequestAt = new Map();
+
+function webhookSecret() {
+  if (process.env.WEBHOOK_SECRET) return process.env.WEBHOOK_SECRET;
+  return crypto.createHash('sha256').update(BOT_TOKEN).digest('hex').slice(0, 32);
+}
+
+function webhookBaseUrl() {
+  const raw = process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!raw) return null;
+  return String(raw).replace(/\/$/, '');
+}
+
+const HOOK_PATH = '/webhook/' + webhookSecret();
+const WEBHOOK_SECRET = webhookSecret();
+const handleWebhook = bot.webhookCallback(HOOK_PATH, { secretToken: WEBHOOK_SECRET });
+let usingWebhook = false;
 
 function loadFiles() {
   if (!fs.existsSync(FILES_PATH)) return {};
@@ -117,12 +134,16 @@ async function sendGameFiles(telegram, chatId, gameId) {
   return sent > 0;
 }
 
-// Чтобы Render не убивал процесс
+// HTTP-сервер: GET / — проверка живости, POST /webhook/<secret> — обновления Telegram
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
+  const pathOnly = (req.url || '/').split('?')[0];
+  if (req.method === 'POST' && pathOnly === HOOK_PATH) {
+    return handleWebhook(req, res);
+  }
   res.writeHead(200);
   res.end('Bot is alive');
-}).listen(PORT);
+});
 
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
@@ -208,15 +229,36 @@ bot.catch((err) => {
   console.error('Bot error', err);
 });
 
-bot.launch().then(() => {
-  console.log('Bot started on port', PORT);
-}).catch((err) => {
-  console.error('Не удалось запустить бота', err);
-  process.exit(1);
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('unhandledRejection', err);
+});
+
+async function startBot() {
+  const base = webhookBaseUrl();
+  if (base) {
+    usingWebhook = true;
+    const url = base + HOOK_PATH;
+    await bot.telegram.setWebhook(url, { secret_token: WEBHOOK_SECRET });
+    console.log('Bot started on port', PORT, 'webhook:', base + '/webhook/...');
+    return;
+  }
+
+  await bot.launch();
+  console.log('Bot started on port', PORT, '(long polling: нет WEBHOOK_URL / RENDER_EXTERNAL_URL)');
+}
+
+server.listen(PORT, () => {
+  startBot().catch((err) => {
+    console.error('Не удалось запустить бота', err);
+    process.exit(1);
+  });
 });
 
 const stop = (signal) => {
-  bot.stop(signal);
+  if (!usingWebhook) bot.stop(signal);
   server.close();
 };
 process.once('SIGINT', () => stop('SIGINT'));
