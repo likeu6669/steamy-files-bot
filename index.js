@@ -20,10 +20,19 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 const FILES_PATH = path.join(__dirname, 'files.json');
 const GAMES_PATH = path.join(__dirname, 'games.json');
 const FILES_WELCOME_PHOTO = path.join(__dirname, 'assets', 'files-welcome.jpg');
-const RATE_MS = 10000;
 const PART_DELAY_MS = 400;
 const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
 const { createSupportBot, normalizeUsername } = require('./support-bot');
+const {
+  createAntispam,
+  isCommandUpdate,
+  parseStartGameId,
+  fileNoticeText,
+  fileNoticeKind,
+  withTelegramRetry,
+  logBotError,
+  isTelegramFloodError
+} = require('./antispam');
 
 const SUPPORT_BOT_TOKEN = process.env.SUPPORT_BOT_TOKEN;
 const DEFAULT_SUPPORT_USERNAME = 'SteamySupportBot';
@@ -36,7 +45,10 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-const lastRequestAt = new Map();
+const filesAntispam = createAntispam({ adminIds: ADMIN_IDS });
+const storeAntispam = createAntispam({ adminIds: ADMIN_IDS });
+filesAntispam.startSweep();
+storeAntispam.startSweep();
 
 function webhookSecret() {
   if (process.env.WEBHOOK_SECRET) return process.env.WEBHOOK_SECRET;
@@ -104,6 +116,28 @@ async function replaceCommandReply(ctx, botTag, kind, sendFn, options) {
     await tryDeleteMessage(ctx.telegram, chatId, ctx.message.message_id);
   }
   return sent;
+}
+
+async function dropLimitedUpdate(ctx) {
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery().catch(() => {});
+    return;
+  }
+  const chatId = ctx.chat && ctx.chat.id;
+  const messageId = ctx.message && ctx.message.message_id;
+  await tryDeleteMessage(ctx.telegram, chatId, messageId);
+}
+
+function attachCommandAntispam(botInstance, gate) {
+  botInstance.use(async (ctx, next) => {
+    const userId = ctx.from && ctx.from.id;
+    if (userId == null || gate.isAdmin(userId)) return next();
+    if (parseStartGameId(ctx)) return next();
+    if (!isCommandUpdate(ctx)) return next();
+    const result = gate.checkCommand(userId, Date.now());
+    if (result.action === 'ok') return next();
+    await dropLimitedUpdate(ctx);
+  });
 }
 
 const STORE_TEXTS = {
@@ -188,6 +222,8 @@ async function sendStoreWelcome(ctx) {
 }
 
 function attachStoreHandlers(store) {
+  attachCommandAntispam(store, storeAntispam);
+
   store.start(async (ctx) => {
     if (!isPrivateChat(ctx)) {
       return ctx.reply(STORE_TEXTS[storeLang(ctx)].writePrivate);
@@ -225,7 +261,7 @@ function attachStoreHandlers(store) {
   });
 
   store.catch((err) => {
-    console.error('Store bot error', err);
+    logBotError('Store bot error', err);
   });
 }
 
@@ -401,7 +437,7 @@ function deliveryExtra(gameId, lang) {
 }
 
 async function sendDeliveryCard(telegram, chatId, gameId, lang) {
-  await telegram.sendMessage(chatId, deliveryText(gameId, lang), {
+  await sendMessageRetry(telegram, chatId, deliveryText(gameId, lang), {
     reply_markup: deliveryKeyboard(gameId, lang)
   });
 }
@@ -456,33 +492,26 @@ function getForwardedPost(msg) {
   return null;
 }
 
-function rateLimited(userId) {
-  const now = Date.now();
-  const prev = lastRequestAt.get(userId) || 0;
-  if (now - prev < RATE_MS) return true;
-  lastRequestAt.set(userId, now);
-  return false;
+async function copyGamePost(telegram, chatId, postId, extra) {
+  return withTelegramRetry(
+    () => extra
+      ? telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId, extra)
+      : telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId),
+    { label: 'copyMessage' }
+  );
 }
 
-const RATE_SWEEP_MS = 60 * 1000;
-setInterval(() => {
-  const now = Date.now();
-  for (const [userId, ts] of lastRequestAt) {
-    if (now - ts >= RATE_MS) lastRequestAt.delete(userId);
-  }
-}, RATE_SWEEP_MS).unref();
-
-async function copyGamePost(telegram, chatId, postId, extra) {
-  if (extra) {
-    return telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId, extra);
-  }
-  return telegram.copyMessage(chatId, STORAGE_CHANNEL_ID, postId);
+function sendMessageRetry(telegram, chatId, text, extra) {
+  return withTelegramRetry(
+    () => extra ? telegram.sendMessage(chatId, text, extra) : telegram.sendMessage(chatId, text),
+    { label: 'sendMessage' }
+  );
 }
 
 async function sendGameFiles(telegram, chatId, gameId, lang) {
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
-    await telegram.sendMessage(chatId, 'Файл для этой игры ещё не загружен.');
+    await sendMessageRetry(telegram, chatId, 'Файл для этой игры ещё не загружен.');
     return false;
   }
 
@@ -510,7 +539,8 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
         } catch (plainErr) {
           const plainDesc = (plainErr && plainErr.description) || (plainErr && plainErr.message) || desc;
           console.error('copyMessage fallback failed', { gameId, postId: posts[i], desc: plainDesc });
-          await telegram.sendMessage(
+          await sendMessageRetry(
+            telegram,
             chatId,
             posts.length > 1
               ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
@@ -518,7 +548,8 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
           ).catch(() => {});
         }
       } else {
-        await telegram.sendMessage(
+        await sendMessageRetry(
+          telegram,
           chatId,
           posts.length > 1
             ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
@@ -529,6 +560,19 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
     if (i < posts.length - 1) await sleep(PART_DELAY_MS);
   }
   return sent > 0;
+}
+
+async function applyFileRequestGuard(ctx, gameId) {
+  const result = filesAntispam.checkFile(ctx.from && ctx.from.id, gameId, Date.now());
+  if (result.action === 'ok') return result;
+  if (result.notifyUser && isPrivateChat(ctx)) {
+    await replaceCommandReply(ctx, 'files', fileNoticeKind(result), () =>
+      ctx.reply(fileNoticeText(userLang(ctx), result))
+    );
+  } else {
+    await dropLimitedUpdate(ctx);
+  }
+  return result;
 }
 
 // HTTP-сервер: GET / — проверка живости, POST /webhook/<secret> — обновления Telegram
@@ -548,27 +592,30 @@ const server = http.createServer((req, res) => {
   res.end('Bot is alive');
 });
 
+attachCommandAntispam(bot, filesAntispam);
+
 bot.start(async (ctx) => {
+  const payload = ctx.startPayload;
+  const gameId = payload && payload.startsWith('game_') ? String(payload).slice('game_'.length) : '';
+  if (isGameId(gameId)) {
+    const gate = await applyFileRequestGuard(ctx, gameId);
+    if (gate.action !== 'ok') return;
+    if (!isPrivateChat(ctx)) {
+      return askToWritePrivately(ctx);
+    }
+    try {
+      await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
+    } catch (err) {
+      logBotError('start delivery failed', err);
+      await ctx.reply('Не удалось отправить файл. Попробуйте ещё раз позже.').catch(() => {});
+    }
+    return;
+  }
+
   if (!isPrivateChat(ctx)) {
     return askToWritePrivately(ctx);
   }
-
-  const payload = ctx.startPayload;
-  const gameId = payload && payload.startsWith('game_') ? String(payload).slice('game_'.length) : '';
-  if (!isGameId(gameId)) {
-    return replaceCommandReply(ctx, 'files', 'start', () => sendFilesWelcome(ctx));
-  }
-
-  if (!isAdmin(ctx) && ctx.from && rateLimited(ctx.from.id)) {
-    return ctx.reply('Подождите несколько секунд перед следующим запросом.');
-  }
-
-  try {
-    await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
-  } catch (err) {
-    console.error('start delivery failed', err);
-    await ctx.reply('Не удалось отправить файл. Попробуйте ещё раз позже.').catch(() => {});
-  }
+  return replaceCommandReply(ctx, 'files', 'start', () => sendFilesWelcome(ctx));
 });
 
 bot.command('help', async (ctx) => {
@@ -635,7 +682,7 @@ bot.command('test', async (ctx) => {
   try {
     await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
   } catch (err) {
-    console.error('test delivery failed', err);
+    logBotError('test delivery failed', err);
     await ctx.reply('Не удалось отправить файл. Проверьте, что бот — админ канала, и что номера постов верные.');
   }
 });
@@ -658,15 +705,16 @@ bot.on('message', async (ctx, next) => {
 });
 
 bot.catch((err) => {
-  console.error('Bot error', err);
+  logBotError('Bot error', err);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('uncaughtException', err);
+  logBotError('uncaughtException', err);
+  if (isTelegramFloodError(err)) return;
   process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('unhandledRejection', err);
+  logBotError('unhandledRejection', err);
 });
 
 async function setupStoreCommands() {
