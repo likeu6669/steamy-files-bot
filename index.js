@@ -23,7 +23,15 @@ const FILES_WELCOME_PHOTO = path.join(__dirname, 'assets', 'files-welcome.jpg');
 const RATE_MS = 10000;
 const PART_DELAY_MS = 400;
 const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
-const RULES_CONTACT = process.env.RULES_CONTACT || process.env.STORE_RULES_CONTACT || '@rule6669';
+const { createSupportBot, normalizeUsername } = require('./support-bot');
+
+const SUPPORT_BOT_TOKEN = process.env.SUPPORT_BOT_TOKEN;
+const SUPPORT_BOT_USERNAME = normalizeUsername(process.env.SUPPORT_BOT_USERNAME);
+const RULES_CONTACT =
+  SUPPORT_BOT_USERNAME ||
+  process.env.RULES_CONTACT ||
+  process.env.STORE_RULES_CONTACT ||
+  '@rule6669';
 
 if (!BOT_TOKEN) {
   console.error('Нужна переменная окружения BOT_TOKEN');
@@ -110,7 +118,9 @@ const STORE_TEXTS = {
     rulesBtn: '📜 Правила',
     help:
       'Я бот магазина Steamy Store.\n' +
-      'Нажмите «Открыть магазин», чтобы зайти в каталог. Канал новостей — @steamystore.',
+      'Нажмите «Открыть магазин», чтобы зайти в каталог. Канал новостей — @steamystore.\n\n' +
+      'По вопросам напишите: ' +
+      RULES_CONTACT,
     rules:
       '🔞 Правила Steamy Store\n\n' +
       '1. Вам исполнилось 18 лет. Здесь игры для взрослых с откровенным контентом.\n' +
@@ -131,7 +141,9 @@ const STORE_TEXTS = {
     rulesBtn: '📜 Rules',
     help:
       'I am the Steamy Store bot.\n' +
-      'Tap “Open the store” to open the catalog. News channel: @steamystore.',
+      'Tap “Open the store” to open the catalog. News channel: @steamystore.\n\n' +
+      'For questions, write to: ' +
+      RULES_CONTACT,
     rules:
       '🔞 Steamy Store rules\n\n' +
       '1. You are 18 or older. This catalog has adult games with explicit content.\n' +
@@ -230,6 +242,19 @@ if (STORE_BOT_TOKEN && STORE_BOT_TOKEN === BOT_TOKEN) {
   console.log('Store bot enabled');
 }
 
+let supportBot = null;
+if (SUPPORT_BOT_TOKEN && (SUPPORT_BOT_TOKEN === BOT_TOKEN || SUPPORT_BOT_TOKEN === STORE_BOT_TOKEN)) {
+  console.error('SUPPORT_BOT_TOKEN совпадает с токеном другого бота — бот поддержки не запущен, чтобы не сломать webhook.');
+} else if (SUPPORT_BOT_TOKEN) {
+  supportBot = createSupportBot({
+    token: SUPPORT_BOT_TOKEN,
+    adminIds: ADMIN_IDS,
+    statePath: path.join(__dirname, 'support-state.json'),
+    replaceCommandReply
+  });
+  console.log('Support bot enabled');
+}
+
 function loadFiles() {
   if (!fs.existsSync(FILES_PATH)) return {};
   try {
@@ -278,7 +303,9 @@ const FILES_TEXTS = {
     help:
       'Я выдаю файлы игр из Steamy Store.\n' +
       'Откройте магазин, выберите карточку и нажмите «Скачать в Telegram». Здесь только публичные версии, 18+.\n\n' +
-      'Канал новостей: @steamystore',
+      'Канал новостей: @steamystore\n\n' +
+      'По вопросам напишите: ' +
+      RULES_CONTACT,
     rules:
       '🔞 Правила Steamy Files\n\n' +
       '1. Вам исполнилось 18 лет. Здесь игры для взрослых с откровенным контентом.\n' +
@@ -302,7 +329,9 @@ const FILES_TEXTS = {
     help:
       'I deliver game files from Steamy Store.\n' +
       'Open the shop, open a game card and tap “Download in Telegram”. These are public versions only, 18+.\n\n' +
-      'News channel: @steamystore',
+      'News channel: @steamystore\n\n' +
+      'For questions, write to: ' +
+      RULES_CONTACT,
     rules:
       '🔞 Steamy Files rules\n\n' +
       '1. You are 18 or older. This catalog has adult games with explicit content.\n' +
@@ -514,6 +543,9 @@ const server = http.createServer((req, res) => {
   if (handleStoreWebhook && req.method === 'POST' && pathOnly === STORE_HOOK_PATH) {
     return handleStoreWebhook(req, res);
   }
+  if (supportBot && req.method === 'POST' && pathOnly === supportBot.hookPath) {
+    return supportBot.handleWebhook(req, res);
+  }
   res.writeHead(200);
   res.end('Bot is alive');
 });
@@ -702,6 +734,7 @@ async function startBot() {
       console.error('Не удалось обновить меню команд бота файлов', err);
     }
     await startStoreBot(base);
+    if (supportBot) await supportBot.start(base);
     return;
   }
 
@@ -713,6 +746,7 @@ async function startBot() {
     console.error('Не удалось обновить меню команд бота файлов', err);
   }
   await startStoreBot(null);
+  if (supportBot) await supportBot.start(null);
 }
 
 server.listen(PORT, () => {
@@ -725,6 +759,7 @@ server.listen(PORT, () => {
 const stop = (signal) => {
   if (!usingWebhook) bot.stop(signal);
   if (storeBot && !usingStoreWebhook) storeBot.stop(signal);
+  if (supportBot) supportBot.stop(signal);
   server.close();
 };
 process.once('SIGINT', () => stop('SIGINT'));
