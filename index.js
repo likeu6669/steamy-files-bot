@@ -23,6 +23,8 @@ const FILES_WELCOME_PHOTO = path.join(__dirname, 'assets', 'files-welcome.jpg');
 const PART_DELAY_MS = 400;
 const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
 const { createSupportBot, normalizeUsername } = require('./support-bot');
+const { createChannelState, parseIdList } = require('./channel-state');
+const { createUpdateDeduper } = require('./update-dedupe');
 const {
   createAntispam,
   isCommandUpdate,
@@ -31,7 +33,9 @@ const {
   fileNoticeKind,
   withTelegramRetry,
   logBotError,
-  isTelegramFloodError
+  isTelegramFloodError,
+  isBlockedError,
+  canRetryWithoutCaption
 } = require('./antispam');
 
 const SUPPORT_BOT_TOKEN = process.env.SUPPORT_BOT_TOKEN;
@@ -190,8 +194,7 @@ const STORE_TEXTS = {
 };
 
 function storeLang(ctx) {
-  const code = String((ctx.from && ctx.from.language_code) || 'ru').toLowerCase();
-  return code.startsWith('en') ? 'en' : 'ru';
+  return langFromCode(ctx && ctx.from && ctx.from.language_code);
 }
 
 function storeKeyboard(lang) {
@@ -222,6 +225,7 @@ async function sendStoreWelcome(ctx) {
 }
 
 function attachStoreHandlers(store) {
+  store.use(createUpdateDeduper());
   attachCommandAntispam(store, storeAntispam);
 
   store.start(async (ctx) => {
@@ -284,7 +288,9 @@ if (SUPPORT_BOT_TOKEN && (SUPPORT_BOT_TOKEN === BOT_TOKEN || SUPPORT_BOT_TOKEN =
     token: SUPPORT_BOT_TOKEN,
     adminIds: ADMIN_IDS,
     statePath: path.join(__dirname, 'support-state.json'),
-    replaceCommandReply
+    replaceCommandReply,
+    extraBannedIds: parseIdList(process.env.BANNED_IDS),
+    onStateChange: () => channelState.scheduleSave()
   });
   console.log('Support bot enabled');
 }
@@ -300,6 +306,37 @@ function loadFiles() {
 }
 
 let files = loadFiles();
+
+// Привязки, сделанные командой /link. Хранятся в канале хранения и после
+// перезапуска Render накладываются поверх files.json из репозитория.
+let linkOverrides = {};
+
+const channelState = createChannelState({
+  telegram: bot.telegram,
+  channelId: STORAGE_CHANNEL_ID,
+  snapshot: () => ({
+    support: supportBot ? supportBot.exportState() : { banned: [], mutes: {}, routes: {} },
+    links: linkOverrides
+  }),
+  apply: (state) => {
+    const saved = (state && state.links) || {};
+    linkOverrides = Object.assign({}, saved, linkOverrides);
+    files = Object.assign({}, files, linkOverrides);
+    if (supportBot && state && state.support) supportBot.importState(state.support);
+  }
+});
+
+const STATE_WAIT_MS = 15000;
+const stateReady = Promise.race([
+  channelState.load().catch((err) => {
+    console.error('state load crashed', err);
+    return false;
+  }),
+  new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), STATE_WAIT_MS);
+    if (t.unref) t.unref();
+  })
+]);
 
 function loadGames() {
   if (!fs.existsSync(GAMES_PATH)) return {};
@@ -321,9 +358,16 @@ function miniAppUrl(gameId) {
   return gameId ? MINI_APP_URL + '=game_' + gameId : MINI_APP_URL;
 }
 
+// Язык по language_code из Telegram: ru* — русский, любой другой — английский.
+// Если Telegram язык не прислал, отвечаем по-русски.
+function langFromCode(raw) {
+  const code = String(raw || '').trim().toLowerCase();
+  if (!code) return 'ru';
+  return code.startsWith('ru') ? 'ru' : 'en';
+}
+
 function userLang(ctx) {
-  const code = String((ctx.from && ctx.from.language_code) || 'ru').toLowerCase();
-  return code.startsWith('en') ? 'en' : 'ru';
+  return langFromCode(ctx && ctx.from && ctx.from.language_code);
 }
 
 const FILES_TEXTS = {
@@ -351,7 +395,12 @@ const FILES_TEXTS = {
       '.',
     support: '❤️ Автору',
     store: '🎮 Магазин',
-    belongs: 'Игра принадлежит разработчику — поддержите автора'
+    belongs: 'Игра принадлежит разработчику — поддержите автора',
+    gameFallback: 'Игра',
+    notUploaded: 'Файл для этой игры ещё не загружен.',
+    writePrivate: 'Напишите мне в личные сообщения, чтобы получить файл.',
+    sendFailed: 'Не удалось отправить файл. Попробуйте ещё раз позже.',
+    partFailed: (i, n) => `Не удалось отправить часть ${i} из ${n}. Попробуйте ещё раз позже.`
   },
   en: {
     welcome:
@@ -377,7 +426,12 @@ const FILES_TEXTS = {
       '.',
     support: '❤️ Author',
     store: '🎮 Store',
-    belongs: 'This game belongs to its developer — please support the author'
+    belongs: 'This game belongs to its developer — please support the author',
+    gameFallback: 'Game',
+    notUploaded: 'The file for this game has not been uploaded yet.',
+    writePrivate: 'Please message me in a private chat to get the file.',
+    sendFailed: 'Could not send the file. Please try again later.',
+    partFailed: (i, n) => `Could not send part ${i} of ${n}. Please try again later.`
   }
 };
 
@@ -422,7 +476,7 @@ function deliveryKeyboard(gameId, lang) {
 function deliveryText(gameId, lang) {
   const txt = FILES_TEXTS[lang] || FILES_TEXTS.ru;
   const meta = gameMeta(gameId);
-  const name = (meta && meta.name) || ('Игра ' + gameId);
+  const name = (meta && meta.name) || (txt.gameFallback + ' ' + gameId);
   let title = '🎮 ' + name;
   if (meta && meta.version) title += ' ' + meta.version;
   title += ' · Android';
@@ -450,8 +504,12 @@ function isPrivateChat(ctx) {
   return ctx.chat && ctx.chat.type === 'private';
 }
 
+function filesText(lang) {
+  return FILES_TEXTS[lang] || FILES_TEXTS.ru;
+}
+
 function askToWritePrivately(ctx) {
-  return ctx.reply('Напишите мне в личные сообщения, чтобы получить файл.');
+  return ctx.reply(filesText(userLang(ctx)).writePrivate);
 }
 
 function isGameId(id) {
@@ -509,14 +567,16 @@ function sendMessageRetry(telegram, chatId, text, extra) {
 }
 
 async function sendGameFiles(telegram, chatId, gameId, lang) {
+  const cardLang = lang || 'ru';
+  const txt = filesText(cardLang);
   const posts = Array.isArray(files[gameId]) ? files[gameId] : [];
   if (!posts.length) {
-    await sendMessageRetry(telegram, chatId, 'Файл для этой игры ещё не загружен.');
+    await sendMessageRetry(telegram, chatId, txt.notUploaded);
     return false;
   }
 
-  const cardLang = lang || 'ru';
   const cardExtra = deliveryExtra(gameId, cardLang);
+  const failNotice = (i) => (posts.length > 1 ? txt.partFailed(i + 1, posts.length) : txt.sendFailed);
   let sent = 0;
   for (let i = 0; i < posts.length; i++) {
     const extra = i === 0 ? cardExtra : undefined;
@@ -526,10 +586,8 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
     } catch (err) {
       const desc = (err && err.description) || (err && err.message) || 'неизвестная ошибка';
       console.error('copyMessage failed', { gameId, postId: posts[i], desc, withCaption: Boolean(extra) });
-      if (String(desc).includes('blocked') || String(desc).includes('bot was blocked')) {
-        return false;
-      }
-      if (extra) {
+      if (isBlockedError(err)) return sent > 0;
+      if (extra && canRetryWithoutCaption(err)) {
         try {
           await copyGamePost(telegram, chatId, posts[i]);
           sent += 1;
@@ -539,22 +597,11 @@ async function sendGameFiles(telegram, chatId, gameId, lang) {
         } catch (plainErr) {
           const plainDesc = (plainErr && plainErr.description) || (plainErr && plainErr.message) || desc;
           console.error('copyMessage fallback failed', { gameId, postId: posts[i], desc: plainDesc });
-          await sendMessageRetry(
-            telegram,
-            chatId,
-            posts.length > 1
-              ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
-              : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
-          ).catch(() => {});
+          if (isBlockedError(plainErr)) return sent > 0;
+          await sendMessageRetry(telegram, chatId, failNotice(i)).catch(() => {});
         }
       } else {
-        await sendMessageRetry(
-          telegram,
-          chatId,
-          posts.length > 1
-            ? `Не удалось отправить часть ${i + 1} из ${posts.length}. Попробуйте ещё раз позже.`
-            : 'Не удалось отправить файл. Попробуйте ещё раз позже.'
-        ).catch(() => {});
+        await sendMessageRetry(telegram, chatId, failNotice(i)).catch(() => {});
       }
     }
     if (i < posts.length - 1) await sleep(PART_DELAY_MS);
@@ -577,21 +624,22 @@ async function applyFileRequestGuard(ctx, gameId) {
 
 // HTTP-сервер: GET / — проверка живости, POST /webhook/<secret> — обновления Telegram
 const PORT = process.env.PORT || 3000;
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const pathOnly = (req.url || '/').split('?')[0];
-  if (req.method === 'POST' && pathOnly === HOOK_PATH) {
-    return handleWebhook(req, res);
-  }
-  if (handleStoreWebhook && req.method === 'POST' && pathOnly === STORE_HOOK_PATH) {
-    return handleStoreWebhook(req, res);
-  }
-  if (supportBot && req.method === 'POST' && pathOnly === supportBot.hookPath) {
-    return supportBot.handleWebhook(req, res);
+  let handler = null;
+  if (req.method === 'POST' && pathOnly === HOOK_PATH) handler = handleWebhook;
+  else if (handleStoreWebhook && req.method === 'POST' && pathOnly === STORE_HOOK_PATH) handler = handleStoreWebhook;
+  else if (supportBot && req.method === 'POST' && pathOnly === supportBot.hookPath) handler = supportBot.handleWebhook;
+  if (handler) {
+    // Сначала дожидаемся загрузки банов и привязок из канала (не дольше 15 секунд).
+    await stateReady;
+    return handler(req, res);
   }
   res.writeHead(200);
   res.end('Bot is alive');
 });
 
+bot.use(createUpdateDeduper());
 attachCommandAntispam(bot, filesAntispam);
 
 bot.start(async (ctx) => {
@@ -607,7 +655,7 @@ bot.start(async (ctx) => {
       await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
     } catch (err) {
       logBotError('start delivery failed', err);
-      await ctx.reply('Не удалось отправить файл. Попробуйте ещё раз позже.').catch(() => {});
+      await ctx.reply(filesText(userLang(ctx)).sendFailed).catch(() => {});
     }
     return;
   }
@@ -657,12 +705,14 @@ bot.command('link', async (ctx) => {
   }
 
   files[gameId] = postIds;
-  const saved = trySaveFiles();
+  linkOverrides[gameId] = postIds;
+  trySaveFiles();
+  const inChannel = channelState.loaded ? await channelState.writeNow() : false;
   const json = mappingJson();
-  const diskNote = saved
-    ? 'Записал в files.json на диске. На Render файл пропадёт после перезапуска — скопируйте его в репозиторий:'
-    : 'На диск записать не удалось, но в памяти привязка есть до перезапуска. Скопируйте в files.json в репозитории:';
-  await ctx.reply(`${diskNote}\n\n${json}`);
+  const note = inChannel
+    ? 'Привязка сохранена в канале хранения и переживёт перезапуск Render. Для порядка можно перенести её и в files.json в репозитории:'
+    : 'Сохранить привязку в канале хранения не удалось, она есть только до перезапуска. Скопируйте в files.json в репозитории:';
+  await ctx.reply(`${note}\n\n${json}`);
 });
 
 bot.command('files', async (ctx) => {
@@ -802,11 +852,18 @@ server.listen(PORT, () => {
   });
 });
 
-const stop = (signal) => {
+const stop = async (signal) => {
   if (!usingWebhook) bot.stop(signal);
   if (storeBot && !usingStoreWebhook) storeBot.stop(signal);
   if (supportBot) supportBot.stop(signal);
   server.close();
+  channelState.stop();
+  // Перед выключением дописываем несохранённые изменения в канал (не дольше 5 секунд).
+  await Promise.race([
+    channelState.flush().catch(() => false),
+    new Promise((resolve) => setTimeout(resolve, 5000))
+  ]);
+  process.exit(0);
 };
 process.once('SIGINT', () => stop('SIGINT'));
 process.once('SIGTERM', () => stop('SIGTERM'));

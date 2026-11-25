@@ -1,6 +1,7 @@
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const crypto = require('crypto');
+const { createUpdateDeduper } = require('./update-dedupe');
 
 const TOPICS = {
   ads: { ru: 'Реклама', en: 'Advertising', emoji: '📣' },
@@ -38,7 +39,11 @@ const TEXTS = {
     banned: 'Вы не можете писать в поддержку.',
     noAdmins: 'Сейчас поддержка недоступна. Попробуйте позже.',
     deliverFailed: 'Не удалось доставить сообщение. Попробуйте ещё раз позже.',
-    prefix: 'Ответ поддержки:'
+    prefix: 'Ответ поддержки:',
+    adminHint:
+      'Это бот поддержки, ваше сообщение никому не отправлено.\n' +
+      'Чтобы ответить пользователю, сделайте реплай на его обращение или напишите:\n' +
+      '/reply ID текст'
   },
   en: {
     welcome:
@@ -54,7 +59,11 @@ const TEXTS = {
     banned: 'You cannot message support.',
     noAdmins: 'Support is unavailable right now. Please try again later.',
     deliverFailed: 'Could not deliver your message. Please try again later.',
-    prefix: 'Support reply:'
+    prefix: 'Support reply:',
+    adminHint:
+      'This is the support bot, your message was not sent to anyone.\n' +
+      'To answer a user, reply to their message or send:\n' +
+      '/reply ID text'
   }
 };
 
@@ -67,8 +76,9 @@ function supportLang(ctxOrCode) {
   const raw = ctxOrCode && ctxOrCode.from
     ? ctxOrCode.from.language_code
     : ctxOrCode;
-  const code = String(raw || 'ru').toLowerCase();
-  return code.startsWith('en') ? 'en' : 'ru';
+  const code = String(raw || '').trim().toLowerCase();
+  if (!code) return 'ru';
+  return code.startsWith('ru') ? 'ru' : 'en';
 }
 
 function topicLabel(topicKey, lang) {
@@ -77,17 +87,13 @@ function topicLabel(topicKey, lang) {
   return topic.emoji + ' ' + name;
 }
 
-function topicKeyboard() {
+function topicKeyboard(lang) {
+  const l = lang === 'en' ? 'en' : 'ru';
+  const btn = (key) => ({ text: topicLabel(key, l), callback_data: 'topic:' + key });
   return {
     inline_keyboard: [
-      [
-        { text: '📣 Реклама', callback_data: 'topic:ads' },
-        { text: '🆘 Помощь', callback_data: 'topic:help' }
-      ],
-      [
-        { text: '©️ Правообладателям', callback_data: 'topic:rights' },
-        { text: '💬 Другое', callback_data: 'topic:other' }
-      ]
+      [btn('ads'), btn('help')],
+      [btn('rights'), btn('other')]
     ]
   };
 }
@@ -396,7 +402,7 @@ function rememberRoute(routes, adminChatId, messageId, userId) {
   }
 }
 
-function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
+function createSupportBot({ token, adminIds, statePath, replaceCommandReply, extraBannedIds, onStateChange }) {
   const admins = Array.isArray(adminIds) ? adminIds.slice() : [];
   const hookSecret = crypto.createHash('sha256').update('support:' + token).digest('hex').slice(0, 32);
   const hookPath = '/webhook/support/' + hookSecret;
@@ -404,7 +410,10 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
   const handleWebhook = bot.webhookCallback(hookPath, { secretToken: hookSecret });
 
   const saved = loadState(statePath);
-  const banned = new Set(saved.banned);
+  const envBanned = (Array.isArray(extraBannedIds) ? extraBannedIds : [])
+    .map(Number)
+    .filter((n) => Number.isInteger(n) && n > 0);
+  const banned = new Set(saved.banned.concat(envBanned));
   const routes = new Map(Object.entries(saved.routes).map(([key, userId]) => [key, Number(userId)]));
   const mutes = new Map(Object.entries(saved.mutes || {}).map(([id, until]) => [Number(id), Number(until)]));
   const sessions = new Map();
@@ -412,6 +421,53 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
   let usingWebhook = false;
 
   function persist() {
+    saveState(statePath, banned, routes, mutes);
+    if (typeof onStateChange === 'function') {
+      try {
+        onStateChange();
+      } catch (err) {
+        console.error('support state change hook failed', err);
+      }
+    }
+  }
+
+  // Снимок для постоянного хранилища (канал хранения).
+  function exportState() {
+    const now = Date.now();
+    const outMutes = {};
+    for (const [id, until] of mutes) {
+      if (Number(until) > now) outMutes[String(id)] = Number(until);
+    }
+    const outRoutes = {};
+    for (const [key, userId] of routes) outRoutes[key] = userId;
+    return { banned: Array.from(banned), mutes: outMutes, routes: outRoutes };
+  }
+
+  // Слияние с сохранённым состоянием: баны объединяются, свежие маршруты
+  // этого запуска не затираются, мут берётся самый долгий.
+  function importState(state) {
+    const st = state || {};
+    const now = Date.now();
+    for (const id of Array.isArray(st.banned) ? st.banned : []) {
+      const n = Number(id);
+      if (Number.isInteger(n) && n > 0) banned.add(n);
+    }
+    for (const [id, until] of Object.entries(st.mutes || {})) {
+      const userId = Number(id);
+      const ts = Number(until);
+      if (!Number.isInteger(userId) || !(ts > now)) continue;
+      if (ts > (mutes.get(userId) || 0)) mutes.set(userId, ts);
+    }
+    const merged = new Map(Object.entries(st.routes || {}).map(([key, userId]) => [key, Number(userId)]));
+    for (const [key, userId] of routes) {
+      merged.delete(key);
+      merged.set(key, userId);
+    }
+    routes.clear();
+    for (const [key, userId] of merged) {
+      if (Number.isInteger(userId) && userId > 0) routes.set(key, userId);
+    }
+    while (routes.size > MAX_ROUTES) routes.delete(routes.keys().next().value);
     saveState(statePath, banned, routes, mutes);
   }
 
@@ -471,7 +527,7 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
   async function sendWelcome(ctx) {
     const lang = supportLang(ctx);
     const txt = TEXTS[lang];
-    return ctx.reply(txt.welcome, { reply_markup: topicKeyboard() });
+    return ctx.reply(txt.welcome, { reply_markup: topicKeyboard(lang) });
   }
 
   async function copyToChat(telegram, toChatId, fromChatId, message) {
@@ -538,6 +594,8 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
     }
     await telegram.copyMessage(userId, msg.chat.id, msg.message_id);
   }
+
+  bot.use(createUpdateDeduper());
 
   bot.start(async (ctx) => {
     if (!isPrivateChat(ctx)) {
@@ -671,6 +729,12 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
       }
     }
 
+    // Админ пишет не реплаем на обращение: тикет не создаём, подсказываем, как ответить.
+    if (isAdminUser(fromId, admins)) {
+      await ctx.reply(TEXTS[supportLang(ctx)].adminHint);
+      return;
+    }
+
     if (!hasForwardableContent(msg)) return;
 
     const admin = isAdminUser(fromId, admins);
@@ -778,6 +842,8 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply }) {
     hookPath,
     hookSecret,
     handleWebhook,
+    exportState,
+    importState,
     start,
     stop,
     get usingWebhook() {
