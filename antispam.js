@@ -314,6 +314,27 @@ async function withTelegramRetry(fn, options) {
   throw lastErr;
 }
 
+function telegramErrorCode(err) {
+  return Number(
+    (err && err.response && err.response.error_code) ||
+    (err && err.error_code) ||
+    (err && err.code) ||
+    0
+  );
+}
+
+function isBlockedError(err) {
+  const desc = String((err && err.description) || (err && err.message) || '');
+  return telegramErrorCode(err) === 403 || /blocked|deactivated/i.test(desc);
+}
+
+// Повторить копирование без подписи можно только после ошибки 400:
+// тогда Telegram точно ничего не отправил. После таймаута, 429 или 5xx
+// файл мог уже дойти, и повтор дал бы человеку второй экземпляр.
+function canRetryWithoutCaption(err) {
+  return telegramErrorCode(err) === 400 && !isBlockedError(err);
+}
+
 function recordActivityAt(rec) {
   const times = []
     .concat(rec.filesMinute || [])
@@ -427,6 +448,9 @@ module.exports = {
   gameIdFromPayload,
   telegramRetryAfterSec,
   isTelegramFloodError,
+  telegramErrorCode,
+  isBlockedError,
+  canRetryWithoutCaption,
   logBotError,
   withTelegramRetry,
   shouldKeepRecord,

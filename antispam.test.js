@@ -295,7 +295,9 @@ async function testRetry() {
   );
 
   const allText = JSON.stringify(FILE_NOTICE) + fileNoticeText('ru', { action: 'limited', reason: 'minute' });
-  assert.ok(!/rule6669/i.test(allText));
+  // В текстах лимитов не должно быть ничьих @юзернеймов (личные контакты не публикуем).
+  assert.ok(!/@[A-Za-z0-9_]{3,}/.test(allText));
+  assert.ok(/@[A-Za-z0-9_]{3,}/.test('Пишите @sample_handle'));
 }
 
 testRetry()
