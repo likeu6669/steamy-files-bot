@@ -25,6 +25,32 @@ const MINI_APP_URL = 'https://t.me/SteamyStore_bot?startapp';
 const { createSupportBot, normalizeUsername } = require('./support-bot');
 const { createChannelState, parseIdList } = require('./channel-state');
 const { createUpdateDeduper } = require('./update-dedupe');
+const { createDb, migrateOnce, formatStats, NO_DB_STATS_TEXT } = require('./db');
+
+// База Supabase: включается, только если заданы обе переменные. Без них боты
+// работают как раньше (память + файл состояния в канале хранения).
+const db = createDb({ url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_KEY });
+if (db) console.log('Supabase: база подключена');
+else if (process.env.SUPABASE_URL || process.env.SUPABASE_SERVICE_KEY) {
+  console.warn('Supabase: задана только одна из переменных SUPABASE_URL / SUPABASE_SERVICE_KEY, база не используется');
+}
+
+function touchUserMiddleware(botTag) {
+  return (ctx, next) => {
+    if (db && ctx.from && !ctx.from.is_bot) db.touchUser(ctx.from, botTag);
+    return next();
+  };
+}
+
+function gameName(gameId) {
+  const meta = gameMeta(gameId);
+  return (meta && meta.name) || ('Игра ' + gameId);
+}
+
+async function statsText() {
+  if (!db) return NO_DB_STATS_TEXT;
+  return formatStats(await db.stats('Europe/Vilnius'), gameName, 'ru');
+}
 const {
   createAntispam,
   isCommandUpdate,
@@ -226,6 +252,7 @@ async function sendStoreWelcome(ctx) {
 
 function attachStoreHandlers(store) {
   store.use(createUpdateDeduper());
+  store.use(touchUserMiddleware('store'));
   attachCommandAntispam(store, storeAntispam);
 
   store.start(async (ctx) => {
@@ -290,7 +317,20 @@ if (SUPPORT_BOT_TOKEN && (SUPPORT_BOT_TOKEN === BOT_TOKEN || SUPPORT_BOT_TOKEN =
     statePath: path.join(__dirname, 'support-state.json'),
     replaceCommandReply,
     extraBannedIds: parseIdList(process.env.BANNED_IDS),
-    onStateChange: () => channelState.scheduleSave()
+    onStateChange: () => channelState.scheduleSave(),
+    hooks: db
+      ? {
+          onUser: (from) => db.touchUser(from, 'support'),
+          onBan: (userId, adminId) => db.addBan(userId, adminId),
+          onUnban: (userId) => db.removeBan(userId),
+          onMute: (userId, until) => db.setMute(userId, until),
+          onTicketMessage: (userId, topic, lang) => db.supportUserMessage(userId, topic, lang),
+          onRoutes: (rows) => db.addRoutes(rows),
+          onAnswered: (userId) => db.ticketAnswered(userId),
+          lookupLang: (userId) => db.userLanguage(userId),
+          statsText
+        }
+      : { statsText }
   });
   console.log('Support bot enabled');
 }
@@ -326,9 +366,49 @@ const channelState = createChannelState({
   }
 });
 
+function gameVersions() {
+  const out = {};
+  for (const [id, meta] of Object.entries(gamesMeta || {})) {
+    if (meta && meta.version) out[id] = meta.version;
+  }
+  return out;
+}
+
+// Порядок при запуске: файл состояния из канала → разовый перенос в пустую базу →
+// данные из базы поверх. Ошибка базы не мешает запуску.
+async function loadPersistentState() {
+  await channelState.load().catch((err) => {
+    console.error('state load crashed', err);
+    return false;
+  });
+  if (!db) return true;
+  const envBans = parseIdList(process.env.BANNED_IDS);
+  // Переносим только после того, как файл из канала прочитан, иначе можно
+  // отметить перенос сделанным, так и не взяв сохранённые баны и привязки.
+  const migration = !channelState.loaded
+    ? { migrated: false, reason: 'channel-not-loaded' }
+    : await migrateOnce(db, {
+    support: supportBot ? supportBot.exportState() : { banned: [], mutes: {}, routes: {} },
+    links: linkOverrides
+  }, { skipBanIds: envBans, versions: gameVersions() });
+  if (migration.migrated) console.log('Supabase: перенесла данные из канала в базу', migration.counts);
+  else if (migration.reason === 'db-error' || migration.reason === 'channel-not-loaded') {
+    console.warn('Supabase: перенос из канала пока не выполнен, попробую при следующем запуске');
+  }
+
+  const [dbLinks, dbSupport] = await Promise.all([db.loadLinks(), db.loadSupport()]);
+  if (dbLinks) {
+    linkOverrides = Object.assign({}, linkOverrides, dbLinks);
+    files = Object.assign({}, files, dbLinks);
+  }
+  if (dbSupport && supportBot) supportBot.importState(dbSupport);
+  if (dbLinks || dbSupport) channelState.scheduleSave();
+  return true;
+}
+
 const STATE_WAIT_MS = 15000;
 const stateReady = Promise.race([
-  channelState.load().catch((err) => {
+  loadPersistentState().catch((err) => {
     console.error('state load crashed', err);
     return false;
   }),
@@ -640,6 +720,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 bot.use(createUpdateDeduper());
+bot.use(touchUserMiddleware('files'));
 attachCommandAntispam(bot, filesAntispam);
 
 bot.start(async (ctx) => {
@@ -651,12 +732,16 @@ bot.start(async (ctx) => {
     if (!isPrivateChat(ctx)) {
       return askToWritePrivately(ctx);
     }
+    const hasFile = Array.isArray(files[gameId]) && files[gameId].length > 0;
+    let ok = false;
     try {
-      await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
+      ok = await sendGameFiles(ctx.telegram, ctx.chat.id, gameId, userLang(ctx));
     } catch (err) {
       logBotError('start delivery failed', err);
       await ctx.reply(filesText(userLang(ctx)).sendFailed).catch(() => {});
     }
+    // Статистика: только реальные выдачи людям (не админам) и только для игр с файлом.
+    if (db && hasFile && !isAdmin(ctx)) db.recordDownload(ctx.from.id, gameId, 'android', ok);
     return;
   }
 
@@ -707,12 +792,23 @@ bot.command('link', async (ctx) => {
   files[gameId] = postIds;
   linkOverrides[gameId] = postIds;
   trySaveFiles();
-  const inChannel = channelState.loaded ? await channelState.writeNow() : false;
+  const meta = gameMeta(gameId);
+  const [inDb, inChannel] = await Promise.all([
+    db ? db.saveLink(gameId, postIds, meta && meta.version) : Promise.resolve(false),
+    channelState.loaded ? channelState.writeNow() : Promise.resolve(false)
+  ]);
   const json = mappingJson();
-  const note = inChannel
-    ? 'Привязка сохранена в канале хранения и переживёт перезапуск Render. Для порядка можно перенести её и в files.json в репозитории:'
-    : 'Сохранить привязку в канале хранения не удалось, она есть только до перезапуска. Скопируйте в files.json в репозитории:';
+  const where = [inDb ? 'в базе' : null, inChannel ? 'в канале хранения' : null].filter(Boolean);
+  const note = where.length
+    ? `Привязка сохранена ${where.join(' и ')} и переживёт перезапуск Render. Для порядка можно перенести её и в files.json в репозитории:`
+    : 'Сохранить привязку не удалось ни в базе, ни в канале хранения, она есть только до перезапуска. Скопируйте в files.json в репозитории:';
   await ctx.reply(`${note}\n\n${json}`);
+});
+
+bot.command('stats', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (!isPrivateChat(ctx)) return askToWritePrivately(ctx);
+  await ctx.reply(await statsText());
 });
 
 bot.command('files', async (ctx) => {

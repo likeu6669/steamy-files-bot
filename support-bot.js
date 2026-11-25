@@ -402,7 +402,25 @@ function rememberRoute(routes, adminChatId, messageId, userId) {
   }
 }
 
-function createSupportBot({ token, adminIds, statePath, replaceCommandReply, extraBannedIds, onStateChange }) {
+function createSupportBot({ token, adminIds, statePath, replaceCommandReply, extraBannedIds, onStateChange, hooks }) {
+  // hooks — необязательная связь с базой данных. Каждый вызов «мягкий»:
+  // ошибка или отсутствие хука не мешает поддержке работать.
+  const h = hooks || {};
+  function fire(name, ...args) {
+    if (typeof h[name] !== 'function') return;
+    Promise.resolve()
+      .then(() => h[name](...args))
+      .catch((err) => console.error('support hook ' + name + ' failed', (err && err.message) || err));
+  }
+  async function ask(name, ...args) {
+    if (typeof h[name] !== 'function') return null;
+    try {
+      return await h[name](...args);
+    } catch (err) {
+      console.error('support hook ' + name + ' failed', (err && err.message) || err);
+      return null;
+    }
+  }
   const admins = Array.isArray(adminIds) ? adminIds.slice() : [];
   const hookSecret = crypto.createHash('sha256').update('support:' + token).digest('hex').slice(0, 32);
   const hookPath = '/webhook/support/' + hookSecret;
@@ -483,6 +501,7 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
   function setFlood(userId, rec) {
     floods.set(userId, rec);
     if (rec && rec.muteUntil && rec.muteUntil > Date.now()) {
+      if (mutes.get(userId) !== rec.muteUntil) fire('onMute', userId, rec.muteUntil);
       mutes.set(userId, rec.muteUntil);
     } else {
       mutes.delete(userId);
@@ -552,23 +571,44 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
       lang: session.lang
     });
     let delivered = 0;
+    const ticketPromise = ask('onTicketMessage', user.id, session.topic, session.lang);
+    const newRoutes = [];
     for (const adminId of admins) {
       try {
         const headerMsg = await telegram.sendMessage(adminId, header);
         rememberRoute(routes, adminId, headerMsg && headerMsg.message_id, user.id);
+        if (headerMsg && headerMsg.message_id) newRoutes.push({ admin_chat_id: adminId, admin_message_id: headerMsg.message_id });
         const copied = await copyToChat(telegram, adminId, message.chat.id, message);
         rememberRoute(routes, adminId, copied && copied.message_id, user.id);
+        if (copied && copied.message_id) newRoutes.push({ admin_chat_id: adminId, admin_message_id: copied.message_id });
         delivered += 1;
       } catch (err) {
         console.error('support deliver to admin failed', { adminId, desc: (err && err.description) || err.message });
       }
     }
     if (delivered) persist();
+    if (newRoutes.length && typeof h.onRoutes === 'function') {
+      ticketPromise.then((ticketId) => {
+        fire('onRoutes', newRoutes.map((r) => Object.assign(r, {
+          user_id: user.id,
+          ticket_id: ticketId,
+          topic: session.topic,
+          language: session.lang
+        })));
+      });
+    }
     return delivered;
   }
 
   async function sendReplyToUser(telegram, userId, source, textOverride) {
+    const known = sessions.has(userId);
     const session = getSession(userId);
+    if (!known) {
+      // После перезапуска язык собеседника берём из базы, если она подключена.
+      const saved = await ask('lookupLang', userId);
+      if (saved === 'ru' || saved === 'en') session.lang = saved;
+      else if (saved) session.lang = supportLang(saved);
+    }
     const lang = session.lang || 'ru';
     if (typeof textOverride === 'string') {
       await telegram.sendMessage(userId, prefixText(textOverride, lang));
@@ -596,6 +636,10 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
   }
 
   bot.use(createUpdateDeduper());
+  bot.use((ctx, next) => {
+    if (ctx.from && !ctx.from.is_bot) fire('onUser', ctx.from);
+    return next();
+  });
 
   bot.start(async (ctx) => {
     if (!isPrivateChat(ctx)) {
@@ -635,10 +679,21 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
     }
     try {
       await sendReplyToUser(ctx.telegram, parsed.userId, null, parsed.text);
+      fire('onAnswered', parsed.userId);
       await ctx.reply('✅ Отправлено');
     } catch (err) {
       await ctx.reply(describeSendError(err));
     }
+  });
+
+  bot.command('stats', async (ctx) => {
+    if (!isAdminUser(ctx.from && ctx.from.id, admins)) {
+      if (isPrivateChat(ctx)) await tryDeleteUserMessage(ctx);
+      return;
+    }
+    if (!isPrivateChat(ctx)) return ctx.reply(TEXTS.ru.writePrivate);
+    const text = await ask('statsText');
+    await ctx.reply(text || 'Статистика недоступна.');
   });
 
   bot.command('ban', async (ctx) => {
@@ -650,6 +705,7 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
     if (!userId) return ctx.reply('Использование: /ban 123456789');
     banned.add(userId);
     persist();
+    fire('onBan', userId, ctx.from && ctx.from.id);
     await ctx.reply('Пользователь ' + userId + ' заблокирован.');
   });
 
@@ -663,6 +719,7 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
     banned.delete(userId);
     clearMute(userId);
     persist();
+    fire('onUnban', userId);
     await ctx.reply('Пользователь ' + userId + ' разблокирован, мут снят.');
   });
 
@@ -717,6 +774,7 @@ function createSupportBot({ token, adminIds, statePath, replaceCommandReply, ext
       if (targetId) {
         try {
           await sendReplyToUser(ctx.telegram, targetId, msg);
+          fire('onAnswered', targetId);
           await ctx.reply('✅ Отправлено');
         } catch (err) {
           await ctx.reply(describeSendError(err));
